@@ -130,6 +130,27 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(self.state()["phase"], "cancelled")
         self.assertFalse((self.home/"sent").exists())
 
+    def test_overdue_wait_recovers_after_worker_restart(self):
+        self.opts["limits"]["rateLimits"]["primary"] = dict(usedPercent=100, resetsAt=None)
+        self.configure()
+        self.command("watch")
+        self.command("_tick")
+        self.assertEqual(self.state()["phase"], "waiting")
+        self.assertFalse((self.home/"sent").exists())
+        # A new process after sleep/login observes an overdue reservation.
+        self.state(due=int(time.time()) - 300)
+        self.command("_tick")
+        self.assertEqual(self.state()["phase"], "waiting")
+        self.assertFalse((self.home/"sent").exists())
+        self.opts["limits"]["rateLimits"]["primary"] = dict(usedPercent=5)
+        self.configure()
+        self.state(due=int(time.time()) - 1)
+        self.command("_tick")
+        self.command("_tick")
+        self.assertEqual(self.state()["phase"], "done")
+        self.assertEqual(len((self.home/"sent").read_text().splitlines()), 1)
+        self.assertFalse(self.plist.exists())
+
     def test_crash_recovery_and_cancel_during_exec(self):
         self.command("watch")
         hold = self.home/"hold"
