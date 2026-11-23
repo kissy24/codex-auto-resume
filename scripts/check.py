@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """Repository checks shared by pre-commit and CI. Never print secret values."""
 import ast
 import os
@@ -43,7 +43,7 @@ def main():
                 failed = True
     if failed:
         return 1
-    return subprocess.call([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-v"])
+    return subprocess.call([sys.executable, "-I", "-m", "pytest", "-q"])
 
 
 if __name__ == "__main__":

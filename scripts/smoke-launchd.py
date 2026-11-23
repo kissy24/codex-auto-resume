@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """Exercise the installed tool with real user launchd and a fake Codex in a temporary HOME."""
 import json
 import os
@@ -31,7 +31,8 @@ def main():
                         limits=dict(rateLimits=dict(limitId="codex", primary=dict(usedPercent=0)),
                                     ordinaryUsageAllowed=True))
         (home / "scenario").write_text(json.dumps(scenario))
-        env = dict(HOME=str(home), PATH=str(tools)+":/usr/bin:/bin")
+        python_bin = Path(sys.executable).resolve().parent
+        env = dict(HOME=str(home), PATH=f"{tools}:{python_bin}:/usr/bin:/bin")
         def command(name):
             return subprocess.check_output([str(cli), name, sid], env=env, text=True, timeout=30)
         def loaded():
@@ -45,6 +46,9 @@ def main():
             else:
                 sys.exit("RunAtLoad または終端時の解除を確認できません: " + command("status"))
             sent = json.loads((home / "sent").read_text())
+            state_dir = home / "Library/Application Support/codex-auto-resume" / sid
+            state = json.loads((state_dir / "state.json").read_text())
+            assert Path(state["python"]).samefile(sys.executable)
             assert sent[:4] == [str(home / "project"), "exec", "resume", sid]
             assert not list((home / "Library/LaunchAgents").glob("*.plist"))
             assert command("cancel").startswith("done")

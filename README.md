@@ -6,15 +6,19 @@ macOS で登録した Codex CLI の会話を監視し、最新ターンに利用
 
 ## 導入と登録
 
-ChatGPT アカウントでログインした `codex` と Python 3.9 以降を用意し、このリポジトリのルートで実行します。登録後もインストール先と Python・Codex の実行パスを維持してください。
+uv と、ChatGPT アカウントでログインした `codex` を用意し、このリポジトリのルートで実行します。uv が用意する Python 3.14 系を使用します。
 
 ```sh
+uv python install 3.14 --upgrade
 mkdir -p "$HOME/.local/bin"
 install -m 755 bin/codex-auto-resume "$HOME/.local/bin/codex-auto-resume"
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$(uv python dir --bin):$HOME/.local/bin:$PATH"
+python3.14 --version
 ```
 
-端末で起動すると、スクリプト先頭の `#!/usr/bin/env python3` がその時点の PATH にある Python 3 を選びます。使うのは Python の標準ライブラリだけです。`watch` は使った Python、スクリプト、Codex CLI の絶対パスを記録し、ユーザー単位の LaunchAgent を登録して終了します。
+端末で起動すると、スクリプト先頭の `#!/usr/bin/env python3.14` が uv の実行ファイルディレクトリにある Python 3.14 を選びます。新しい端末でも同じ PATH を使えるように、必要に応じて上記の `export` をシェルの設定に追加してください。CLI の実行には Python の標準ライブラリを使います。`watch` は使った Python、スクリプト、Codex CLI の絶対パスを記録し、ユーザー単位の LaunchAgent を登録して終了します。
+
+登録中は記録された実行パスを維持してください。以前の Python で作成した予約を移行するには、新しい CLI で `cancel SESSION_ID` を実行し、`watch SESSION_ID --new` で登録し直します。`dispatching` の予約は処理の終了を待ちます。
 
 以降は macOS の `launchd` が登録時・ログイン時と約60秒ごとに、記録した Python で `codex-auto-resume _tick SESSION_ID` を起動します。通常は1回確認して終了し、待機期限前ならローカルの状態を読むだけです。回復を確認すると、元の作業ディレクトリで `codex exec resume` を起動し、その終了結果を記録します。
 
@@ -60,11 +64,18 @@ rm "$HOME/.local/bin/codex-auto-resume"
 
 ## 開発と検証
 
-`python3 -I scripts/check.py` で、追跡ファイルの認証情報パターン、シェル経由の起動、模擬 RPC と予約状態のテストを検査します。pre-commit がインストール済みなら次を実行してください。GitHub Actions は push・PR 時に macOS 上で同じ検査を実行します。
+開発環境は uv で作成します。pytest とその依存バージョンは `uv.lock` に記録されています。
+
+```sh
+uv sync --locked
+uv run --locked pytest
+```
+
+`uv run --locked python -I scripts/check.py` は追跡ファイルの認証情報パターンとシェル経由の起動を検査し、pytest を実行します。pre-commit と GitHub Actions の macOS ジョブもこのコマンドを使います。pre-commit がインストール済みなら次を実行してください。
 
 ```sh
 pre-commit install
 pre-commit run --all-files
 ```
 
-ログイン中の Mac では `python3 -I scripts/smoke-launchd.py` で、空の一時 HOME への配布、実際の LaunchAgent の登録・自動起動、模擬 Codex への一回送信、終端時と手動での解除を再現できます。上記の実機環境でこの検証を実施しました。CI の Codex と launchctl はどちらも模擬実装です。
+ログイン中の Mac では `uv run --locked python -I scripts/smoke-launchd.py` で、空の一時 HOME への配布、実際の LaunchAgent の登録・自動起動、模擬 Codex への一回送信、終端時と手動での解除を再現できます。macOS 27.2.1 と uv 管理の Python 3.14.9 でこの検証を実施しました。CI の Codex と launchctl はどちらも模擬実装です。

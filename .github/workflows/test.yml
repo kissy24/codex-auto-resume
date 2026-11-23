@@ -10,5 +10,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
+          enable-cache: false
       - name: Check security rules and run mock RPC tests
-        run: python3 -I scripts/check.py
+        run: uv run --locked python -I scripts/check.py

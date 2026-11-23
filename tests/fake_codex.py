@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 """stdio fixture. All data belongs to the test HOME."""
 import json
 import os
