@@ -14,6 +14,10 @@ install -m 755 bin/codex-auto-resume "$HOME/.local/bin/codex-auto-resume"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+端末で起動すると、スクリプト先頭の `#!/usr/bin/env python3` がその時点の PATH にある Python 3 を選びます。使うのは Python の標準ライブラリだけです。`watch` は使った Python、スクリプト、Codex CLI の絶対パスを記録し、ユーザー単位の LaunchAgent を登録して終了します。
+
+以降は macOS の `launchd` が登録時・ログイン時と約60秒ごとに、記録した Python で `codex-auto-resume _tick SESSION_ID` を起動します。通常は1回確認して終了し、待機期限前ならローカルの状態を読むだけです。回復を確認すると、元の作業ディレクトリで `codex exec resume` を起動し、その終了結果を記録します。
+
 対象の対話型 Codex で `/status` を開き、セッション ID をコピーします。次の `SESSION_ID` はその UUID に置き換えてください。
 
 ```sh
