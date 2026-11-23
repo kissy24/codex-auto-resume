@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""macOS の Codex セッションを利用枠の回復後に一度だけ再開します。"""
+import argparse
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import uuid
+
+
+class Attention(Exception):
+    """User action is required. Messages must be safe to persist."""
+
+
+class Retry(Exception):
+    """Temporary failure. Messages must be safe to persist."""
+
+
+def timeout(*_):
+    raise Retry("App Server の応答がタイムアウトしました")
+
+
+@contextmanager
+def server(codex):
+    with subprocess.Popen([codex, "app-server", "--stdio"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          encoding="utf-8") as proc:
+        counter = 0
+
+        def send(msg):
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+
+        def call(method, params):
+            nonlocal counter
+            counter += 1
+            signal.alarm(30)
+            try:
+                send({"method": method, "params": params, "id": counter})
+                for line in proc.stdout:
+                    msg = json.loads(line)
+                    if msg.get("id") != counter or "method" in msg:
+                        continue
+                    if "error" in msg:
+                        # Inspect privately. Server messages may contain account or turn data.
+                        error = msg["error"]
+                        message = str(error.get("message", "")).lower()
+                        if error.get("code") in (401, 403) or any(s in message for s in
+                                ("unauthorized", "unauthenticated", "401", "sign in", "not logged in")):
+                            raise Attention("Codex の ChatGPT ログインを確認してください")
+                        if error.get("code") in (-32601, -32602):
+                            raise Attention("Codex CLI の RPC 対応版とセッション ID を確認してください")
+                        raise Retry("App Server の照会に失敗しました")
+                    return msg["result"]
+                raise Retry("App Server が応答前に終了しました")
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise Retry("App Server との接続が閉じました") from exc
+            finally:
+                signal.alarm(0)
+
+        previous = signal.signal(signal.SIGALRM, timeout)
+        try:
+            call("initialize", {"clientInfo": {"name": "auto_resume", "version": "1"}})
+            send({"method": "initialized", "params": {}})
+            yield call
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def check_account(call):
+    account = call("account/read", {"refreshToken": False}).get("account")
+    if not account or account.get("type") != "chatgpt":
+        raise Attention("Codex に ChatGPT アカウントでログインしてください")
+
+
+def directory(call, sid):
+    thread = call("thread/read", {"threadId": sid, "includeTurns": False})["thread"]
+    cwd = Path(thread["cwd"])
+    if thread["id"] != sid or not cwd.is_absolute() or not cwd.is_dir():
+        raise Attention("セッション ID と元の作業ディレクトリを確認してください")
+    return str(cwd)
+
+
+def latest(call, sid):
+    turns = call("thread/turns/list", {"threadId": sid, "limit": 1,
+                                       "sortDirection": "desc", "itemsView": "notLoaded"})
+    return next(iter(turns["data"]), {})
+
+
+def failed_turn(turn):
+    if (turn.get("status") == "failed" and
+            (turn.get("error") or {}).get("codexErrorInfo") == "usageLimitExceeded"):
+        if not turn.get("id"):
+            raise Attention("失敗ターン ID を確認できません")
+        return turn["id"]
+    return None
+
+
+def limits(call, bucket):
+    """Return selected ID, whether exhausted, and latest known reset in Unix seconds."""
+    data = call("account/rateLimits/read", {"excludeResetCreditDetails": True})
+    options = data.get("rateLimitsByLimitId") or {}
+    if not options:
+        single = data.get("rateLimits") or {}
+        if single.get("limitId"):
+            options = {single["limitId"]: single}
+    if bucket is None and len(options) == 1:
+        bucket = next(iter(options))
+    if not bucket or bucket not in options:
+        raise Attention("利用枠を特定できません。--bucket に対象の limit ID を指定してください")
+    snap = options[bucket]
+    if snap.get("limitId") not in (None, bucket):
+        raise Attention("利用枠 ID が一致しません")
+    reason = snap.get("rateLimitReachedType")
+    if (snap.get("spendControlReached") or reason not in (None, "rate_limit_reached")
+            or (snap.get("individualLimit") or {}).get("remainingPercent", 1) <= 0):
+        raise Attention("支出上限またはクレジット制限を確認してください")
+    windows = [snap[key] for key in ("primary", "secondary") if snap.get(key) is not None]
+    if not windows or any(type(w.get("usedPercent")) is not int or w["usedPercent"] < 0
+                          for w in windows):
+        raise Attention("利用枠の使用率を確認できません")
+    full = [w for w in windows if w["usedPercent"] >= 100]
+    due = max((w["resetsAt"] for w in full if type(w.get("resetsAt")) is int), default=0)
+    if full or reason or data.get("ordinaryUsageAllowed") is False:
+        return bucket, True, due
+    if data.get("ordinaryUsageAllowed") is not True:
+        raise Attention("通常の利用枠で再開できるか確認できません")
+    return bucket, False, 0
+
+
+def executable():
+    path = shutil.which("codex")
+    if not path:
+        raise Attention("PATH 上に codex がありません")
+    return os.path.abspath(path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["probe"])
+    parser.add_argument("session_id", type=uuid.UUID)
+    parser.add_argument("--bucket", help="対象の利用枠 ID")
+    args = parser.parse_args()
+    sid = str(args.session_id)
+    with server(executable()) as call:
+        check_account(call)
+        directory(call, sid)
+        turn = failed_turn(latest(call, sid))
+        bucket, full, due = limits(call, args.bucket)
+    print("上限停止ターン:", turn or "検知なし")
+    print("利用枠:", bucket, "制限中" if full else "利用可", "リセット予定 (Unix 秒):", due or "—")
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        main()
+    except (Attention, Retry, OSError) as exc:
+        sys.exit(str(exc))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        sys.exit("Codex の応答形式を確認してください")
