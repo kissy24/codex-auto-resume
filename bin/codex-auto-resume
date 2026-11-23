@@ -277,10 +277,9 @@ class Reservation:
     def poll(self, state):
         """Called under the state lock. Return true only to the dispatch owner."""
         if state["phase"] == "dispatching":
-            self.finish(state, "needs_attention", "送信結果が不明です。会話履歴を確認してください")
+            self.save(state, "needs_attention", "送信結果が不明です。会話履歴を確認してください")
             return False
         if state["phase"] not in ACTIVE:
-            self.disable()
             return False
         if time.time() < state["due"]:
             return False
@@ -290,7 +289,7 @@ class Reservation:
             check_account(call)
             turn = latest(call, self.sid)
             if state["turn"] and turn.get("id") != state["turn"]:
-                self.finish(state, "cancelled", "最新ターンが変わったため予約を解除しました")
+                self.save(state, "cancelled", "最新ターンが変わったため予約を解除しました")
                 return False
             target = failed_turn(turn)
             if not target or target == state.get("attempted_turn"):
@@ -310,7 +309,7 @@ class Reservation:
                     self.retry(state, "利用枠が未回復です")
                 return False
             if failed_turn(latest(call, self.sid)) != target:
-                self.finish(state, "cancelled", "送信前に最新ターンが変わりました")
+                self.save(state, "cancelled", "送信前に最新ターンが変わりました")
                 return False
         self.save(state, "dispatching", "送信を試行中です。会話履歴で確認できます",
                   attempted_turn=target, failures=0)
@@ -329,8 +328,10 @@ class Reservation:
                         return
                     except (Attention, OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
                         reason = str(exc) if isinstance(exc, Attention) else "Codex の実行パスと応答形式を確認してください"
-                        self.finish(state, "needs_attention", reason)
-                        return
+                        self.save(state, "needs_attention", reason)
+                        dispatch = False
+                    if state["phase"] not in ACTIVE:
+                        self.disable()
                 if dispatch:
                     self.dispatch(state)
         except BlockingIOError:

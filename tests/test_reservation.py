@@ -29,6 +29,7 @@ def launchctl(command, *args):
         if (Path.home() / "refuse").exists(): return 1
         marker.touch()
     elif command == "bootout":
+        if (Path.home() / "refuse-bootout").exists(): return 1
         marker.unlink()
     return 0
 app["main"].__globals__["launchctl"] = launchctl
@@ -176,6 +177,22 @@ class ReservationTests(unittest.TestCase):
         self.assertIn("needs_attention", self.command("status").stdout)
         self.assertFalse(self.plist.exists())
         self.assertEqual(len((self.home/"sent").read_text().splitlines()), 1)
+
+    def test_cleanup_failure_preserves_dispatch_result(self):
+        self.command("watch")
+        refuse = self.home / "refuse-bootout"
+        refuse.touch()
+        self.assertNotEqual(self.command("_tick", check=False).returncode, 0)
+        result = self.state()
+        self.assertEqual((result["phase"], result["exit_code"]), ("done", 0))
+        self.assertNotEqual(self.command("_tick", check=False).returncode, 0)
+        self.assertEqual(self.state(), result)
+        refuse.unlink()
+        self.command("_tick")
+        self.assertFalse((self.home / "loaded").exists())
+        self.assertFalse(self.plist.exists())
+        self.assertEqual(self.state(), result)
+        self.assertEqual(len((self.home / "sent").read_text().splitlines()), 1)
 
     def test_registration_failure_and_retry(self):
         refuse = self.home/"refuse"
