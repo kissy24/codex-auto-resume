@@ -2,13 +2,18 @@
 """macOS の Codex セッションを利用枠の回復後に一度だけ再開します。"""
 import argparse
 from contextlib import contextmanager
+from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 
 
@@ -144,20 +149,248 @@ def executable():
     return os.path.abspath(path)
 
 
+PROMPT = "利用上限で中断した依頼について、現在の作業状況と実行済みの操作を確認し、元の依頼の範囲で未完了の作業を続けてください。"
+ACTIVE = {"watching", "waiting", "dispatching"}
+
+
+def atomic_write(path, content):
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
+        tmp = Path(f.name)
+        try:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def lock(path, blocking=True):
+    with path.open("a") as handle:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(handle, flags)
+        yield
+
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl", *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode
+
+
+class Reservation:
+    def __init__(self, sid):
+        self.sid = sid
+        self.job = Path.home() / "Library/Application Support/codex-auto-resume" / sid
+        self.path = self.job / "state.json"
+        self.label = "local.codex-auto-resume." + sid
+        self.domain = "gui/" + str(os.getuid())
+        self.service = self.domain + "/" + self.label
+        self.plist = Path.home() / "Library/LaunchAgents" / (self.label + ".plist")
+
+    def read(self):
+        state = json.loads(self.path.read_text())
+        if state.get("schema") != 1 or state.get("session_id") != self.sid:
+            raise Attention("予約履歴の形式を確認してください")
+        return state
+
+    def save(self, state, phase, detail, **fields):
+        previous = state.get("phase")
+        fields.setdefault("due", 0)
+        state.update(phase=phase, detail=detail, **fields)
+        atomic_write(self.path, (json.dumps(state, ensure_ascii=False) + "\n").encode())
+        if phase != previous:
+            with (self.job / "monitor.log").open("a") as log:
+                print(datetime.now().astimezone().isoformat(), phase,
+                      state.get("exit_code", ""), file=log)
+
+    def enable(self, state):
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        config = dict(Label=self.label, RunAtLoad=True, StartInterval=60,
+                      ProgramArguments=[state["python"], "-I", state["tool"], "_tick", self.sid],
+                      EnvironmentVariables=state["environment"])
+        atomic_write(self.plist, plistlib.dumps(config))
+        if launchctl("print", self.service) and launchctl("bootstrap", self.domain, str(self.plist)):
+            raise Attention("LaunchAgent を登録できません。ログイン後に watch を再実行してください")
+
+    def disable(self):
+        # Unlink before bootout, which may terminate the calling LaunchAgent itself.
+        self.plist.unlink(missing_ok=True)
+        if launchctl("print", self.service) == 0:
+            if launchctl("bootout", self.service) and launchctl("print", self.service) == 0:
+                raise Attention("LaunchAgent を解除できません。cancel を再実行してください")
+
+    def finish(self, state, phase, detail, **fields):
+        self.save(state, phase, detail, **fields)
+        self.disable()
+
+    def watch(self, bucket, renew):
+        self.job.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with lock(self.job / "lock"):
+            old = self.read() if self.path.exists() else {}
+            if old and old["phase"] in ACTIVE:
+                if old["phase"] != "dispatching":
+                    self.enable(old)
+                return old
+            if old:
+                self.disable()
+                if not renew and not old.get("registration_failed"):
+                    return old
+            codex = executable()
+            with server(codex) as call:
+                check_account(call)
+                cwd = directory(call, self.sid)
+                latest(call, self.sid)
+            state = dict(schema=1, session_id=self.sid, cwd=cwd, codex=codex,
+                         bucket=bucket, tool=str(Path(__file__).resolve()), python=sys.executable,
+                         environment={k: os.environ[k] for k in ("HOME", "PATH", "CODEX_HOME") if k in os.environ},
+                         turn=None, attempted_turn=old.get("attempted_turn"), failures=0)
+            self.save(state, "watching", "次の上限停止を監視しています")
+            try:
+                self.enable(state)
+            except (OSError, Attention):
+                self.finish(state, "needs_attention", "LaunchAgent 登録失敗。watch で再登録してください",
+                            registration_failed=True)
+                raise
+            return state
+
+    def cancel(self):
+        with lock(self.job / "lock"):
+            state = self.read()
+            if state["phase"] in ("watching", "waiting"):
+                self.finish(state, "cancelled", "予約を解除しました")
+            elif state["phase"] != "dispatching":
+                self.disable()
+            return state
+
+    def retry(self, state, reason, phase=None):
+        failures = min(state["failures"] + 1, 5)
+        delay = min(60 * 2 ** (failures - 1), 900)
+        self.save(state, phase or state["phase"], reason, failures=failures,
+                  due=int(time.time()) + delay)
+
+    def poll(self, state):
+        """Called under the state lock. Return true only to the dispatch owner."""
+        if state["phase"] == "dispatching":
+            self.finish(state, "needs_attention", "送信結果が不明です。会話履歴を確認してください")
+            return False
+        if state["phase"] not in ACTIVE:
+            self.disable()
+            return False
+        if time.time() < state["due"]:
+            return False
+        if not Path(state["cwd"]).is_dir():
+            raise Attention("元の作業ディレクトリを確認してください")
+        with server(state["codex"]) as call:
+            check_account(call)
+            turn = latest(call, self.sid)
+            if state["turn"] and turn.get("id") != state["turn"]:
+                self.finish(state, "cancelled", "最新ターンが変わったため予約を解除しました")
+                return False
+            target = failed_turn(turn)
+            if not target or target == state.get("attempted_turn"):
+                if state["turn"]:
+                    raise Attention("保存した失敗ターンの状態を会話履歴で確認してください")
+                if state["failures"]:
+                    self.save(state, "watching", "次の上限停止を監視しています", failures=0)
+                return False
+            if state["turn"] is None:
+                self.save(state, "waiting", "利用上限による停止を検知しました", turn=target, failures=0)
+            bucket, full, reset = limits(call, state["bucket"])
+            state["bucket"] = bucket
+            if full:
+                if reset > time.time():
+                    self.save(state, "waiting", "利用枠の回復待ち", due=reset, failures=0)
+                else:
+                    self.retry(state, "利用枠が未回復です")
+                return False
+            if failed_turn(latest(call, self.sid)) != target:
+                self.finish(state, "cancelled", "送信前に最新ターンが変わりました")
+                return False
+        self.save(state, "dispatching", "送信を試行中です。会話履歴で確認できます",
+                  attempted_turn=target, failures=0)
+        return True
+
+    def tick(self):
+        # The worker lock survives across exec resume. status and cancel remain available.
+        try:
+            with lock(self.job / "worker.lock", blocking=False):
+                with lock(self.job / "lock"):
+                    state = self.read()
+                    try:
+                        dispatch = self.poll(state)
+                    except Retry as exc:
+                        self.retry(state, str(exc))
+                        return
+                    except (Attention, OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+                        reason = str(exc) if isinstance(exc, Attention) else "Codex の実行パスと応答形式を確認してください"
+                        self.finish(state, "needs_attention", reason)
+                        return
+                if dispatch:
+                    self.dispatch(state)
+        except BlockingIOError:
+            return
+
+    def dispatch(self, state):
+        try:
+            result = subprocess.run([state["codex"], "exec", "resume", self.sid, PROMPT],
+                                    cwd=state["cwd"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            code = result.returncode
+        except OSError:
+            code = None
+        with lock(self.job / "lock"):
+            phase = "done" if code == 0 else "needs_attention"
+            self.finish(state, phase, "送信を試行しました。会話履歴を確認してください", exit_code=code)
+
+
+def show(state):
+    print(state["phase"], state["detail"])
+    print("利用枠:", state["bucket"] or "失敗時に特定")
+    if state["due"]:
+        print("次回確認:", datetime.fromtimestamp(state["due"]).astimezone().isoformat())
+    if state.get("attempted_turn"):
+        print("送信試行済みターン:", state["attempted_turn"])
+    if "exit_code" in state:
+        print("終了コード:", state["exit_code"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["probe"])
-    parser.add_argument("session_id", type=uuid.UUID)
-    parser.add_argument("--bucket", help="対象の利用枠 ID")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("probe", "watch", "status", "cancel", "_tick"):
+        sub = commands.add_parser(name)
+        sub.add_argument("session_id", type=uuid.UUID)
+        if name in ("probe", "watch"):
+            sub.add_argument("--bucket", help="対象の利用枠 ID")
+        if name == "watch":
+            sub.add_argument("--new", action="store_true", help="終了履歴を確認後、新しい予約を作る")
     args = parser.parse_args()
     sid = str(args.session_id)
-    with server(executable()) as call:
-        check_account(call)
-        directory(call, sid)
-        turn = failed_turn(latest(call, sid))
-        bucket, full, due = limits(call, args.bucket)
-    print("上限停止ターン:", turn or "検知なし")
-    print("利用枠:", bucket, "制限中" if full else "利用可", "リセット予定 (Unix 秒):", due or "—")
+    job = Reservation(sid)
+    if args.command == "probe":
+        with server(executable()) as call:
+            check_account(call)
+            directory(call, sid)
+            turn = failed_turn(latest(call, sid))
+            print("上限停止ターン:", turn or "検知なし")
+            bucket, full, due = limits(call, args.bucket)
+        print("利用枠:", bucket, "制限中" if full else "利用可", "リセット予定 (Unix 秒):", due or "—")
+    elif args.command == "watch":
+        show(job.watch(args.bucket, args.new))
+    elif not job.path.exists():
+        raise Attention("このセッションの予約履歴はありません")
+    elif args.command == "status":
+        show(job.read())
+    elif args.command == "cancel":
+        show(job.cancel())
+    else:
+        job.tick()
 
 
 if __name__ == "__main__":
@@ -167,4 +400,4 @@ if __name__ == "__main__":
     except (Attention, Retry, OSError) as exc:
         sys.exit(str(exc))
     except (KeyError, TypeError, ValueError, AttributeError):
-        sys.exit("Codex の応答形式を確認してください")
+        sys.exit("Codex の応答または予約履歴の形式を確認してください")
