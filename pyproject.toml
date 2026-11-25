@@ -1,0 +1,15 @@
+[project]
+name = "codex-auto-resume"
+version = "0.1.0"
+requires-python = ">=3.14,<3.15"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+
+[tool.uv]
+package = false
+python-preference = "only-managed"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

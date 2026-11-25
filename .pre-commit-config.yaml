@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: security-and-tests
+        name: Check credentials, subprocess usage and reservation behavior
+        entry: uv run --locked python -I scripts/check.py
+        language: system
+        pass_filenames: false
+        always_run: true
